@@ -1,0 +1,16 @@
+[project]
+name = "personal-ai-steward"
+version = "0.1.0"
+description = "Local-first personal steward. This increment captures authorized Chrome page bodies on the PC and expires them after seven days."
+requires-python = ">=3.11"
+readme = "README.md"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["steward"]
+mypy_path = "src"
