@@ -19,7 +19,7 @@ from uuid import uuid4
 
 from steward.clock import Clock
 from steward.models import BodyRead, ChromeObservation, ChromePage
-from steward.policy import VisibleCapture, decide_ordinary_page, normalize_site
+from steward.policy import VisibleCapture, decide_ordinary_page, normalize_site, page_identity
 
 _SEVEN_DAYS = timedelta(days=7)
 _LOGGER = logging.getLogger("steward.capture")
@@ -86,14 +86,14 @@ class StoredActivity:
 class _OpenSegment:
     """In-memory identity of the page currently being timed.
 
-    The URL is kept here so a path change starts a new capture. It is never
-    written to a record, log, export, or backup.
+    The identity has no userinfo or fragment and is never written to a record,
+    log, export, or backup. A path or query change starts a new capture.
     """
 
     activity_id: str
     page_id: str
     incognito: bool
-    url: str
+    identity: str
     visible: VisibleCapture
 
 
@@ -126,11 +126,13 @@ class Steward:
         self._approved: set[str] = set()
         self._records: list[StoredActivity] = []
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.data_dir.chmod(0o700)
         self._load_permissions()
         rewrite = self._load_records()
         if rewrite:
             self._write_records()
         self._enforce_expiry()
+        self._restrict_private_files()
 
     @property
     def observation_state(self) -> str:
@@ -262,7 +264,7 @@ class Steward:
             activity_id=record.id,
             page_id="",
             incognito=True,
-            url="",
+            identity="",
             visible=visible,
         )
         self._write_records()
@@ -271,19 +273,26 @@ class Steward:
     def _retain_ordinary(self, page: ChromePage) -> None:
         visible, body = decide_ordinary_page(page, self._approved)
         now = self._clock.now()
+        identity = page_identity(page.url)
         if (
             self._open is not None
             and not self._open.incognito
             and self._open.page_id == page.page_id
-            and self._open.url == page.url
-            and self._open.visible == visible
+            and self._open.identity == identity
+            and _same_outcome(self._open.visible, visible)
         ):
-            # Same focused page as the open segment. Keep the original body so
-            # polling cannot move the seven-day deadline forward.
-            self._touch(self._require(self._open.activity_id), now)
-            self._write_records()
-            self._logger.info("extended focused chrome page status=%s", visible.page_content)
-            return
+            record = self._require(self._open.activity_id)
+            if record.page_content == "available":
+                # Same focused page. A title change is still that page, and the
+                # original body keeps its capture time.
+                if visible.title is not None and record.title != visible.title:
+                    record.title = visible.title
+                self._touch(record, now)
+                self._write_records()
+                self._logger.info("extended focused chrome page status=%s", visible.page_content)
+                return
+        # The previous body has expired, or this is a different page. Start a
+        # new record so the new text gets its own seven-day clock.
         payload_id = None if body is None else self._write_body(body)
         record = self._new_record(now, visible, payload_id)
         previous = self._open
@@ -292,7 +301,7 @@ class Steward:
             activity_id=record.id,
             page_id=page.page_id,
             incognito=False,
-            url=page.url,
+            identity=identity,
             visible=visible,
         )
         try:
@@ -374,8 +383,22 @@ class Steward:
         if path is None:
             raise ValueError("body payload id was rejected")
         path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.chmod(0o700)
         path.write_bytes(body.encode("utf-8"))
+        path.chmod(0o600)
         return payload_id
+
+    def _restrict_private_files(self) -> None:
+        if self.data_dir.is_symlink():
+            return
+        self.data_dir.chmod(0o700)
+        for path in self.data_dir.rglob("*"):
+            if path.is_symlink():
+                continue
+            if path.is_dir():
+                path.chmod(0o700)
+            elif path.is_file():
+                path.chmod(0o600)
 
     def _remove_untracked_bodies(self) -> None:
         directory = self.data_dir / "bodies"
@@ -464,6 +487,15 @@ class Steward:
         )
 
 
+def _same_outcome(current: VisibleCapture, new: VisibleCapture) -> bool:
+    return (
+        current.domain == new.domain
+        and current.page_content == new.page_content
+        and current.unavailable_reason == new.unavailable_reason
+        and current.source_text_role == new.source_text_role
+    )
+
+
 def _require_site(site: str) -> str:
     return normalize_site(site)
 
@@ -534,4 +566,6 @@ def _write_json(path: Path, payload: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.chmod(0o600)
     temporary.replace(path)
+    path.chmod(0o600)

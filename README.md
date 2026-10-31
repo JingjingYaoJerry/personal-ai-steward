@@ -20,7 +20,7 @@ python -m pytest
 python -m mypy
 ```
 
-`tests/test_chrome_cdp.py` starts Google Chrome on a virtual display, so Chrome and Xvfb need to be installed. The other tests do not.
+`tests/test_chrome_cdp.py` starts Google Chrome on a virtual display, so Chrome and Xvfb need to be installed. The other tests do not. The adapter only sees a Chrome process that was started with a remote debugging port, and it uses that Chrome's focused visible page.
 
 ### Run the capture boundary
 

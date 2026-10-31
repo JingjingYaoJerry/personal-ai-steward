@@ -275,19 +275,28 @@ def _ordinary_page(
 ) -> ChromeObservation:
     target_id = info.get("targetId")
     url = info.get("url")
-    title = info.get("title")
-    if not isinstance(target_id, str) or not isinstance(url, str) or not isinstance(title, str):
+    if not isinstance(target_id, str) or not isinstance(url, str):
         return ChromeObservation(focused=True, incognito=False)
+    # document.title, not the tab label. Chrome fills an empty title with the
+    # page address, and that address must not become the stored title.
     try:
-        body_value = browser.evaluate(session, "document.body ? document.body.innerText : ''")
+        payload = browser.evaluate(
+            session,
+            "({title: document.title || '', body: document.body ? document.body.innerText : ''})",
+        )
     except OSError:
-        body_value = None
-    if isinstance(body_value, str):
-        body: str | None = body_value
-        extraction = "ok"
-    else:
-        body = None
-        extraction = "failed"
+        payload = None
+    title = ""
+    body: str | None = None
+    extraction = "failed"
+    if isinstance(payload, dict):
+        raw_title = payload.get("title")
+        raw_body = payload.get("body")
+        if isinstance(raw_title, str):
+            title = raw_title
+        if isinstance(raw_body, str):
+            body = raw_body
+            extraction = "ok"
     return ChromeObservation(
         focused=True,
         incognito=False,

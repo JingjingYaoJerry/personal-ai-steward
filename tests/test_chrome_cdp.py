@@ -17,6 +17,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from collections.abc import Iterator
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -40,6 +41,9 @@ UNAPPROVED_TITLE = "UNAPPROVED_LIVE_TITLE"
 UNAPPROVED_BODY = "UNAPPROVED_LIVE_BODY"
 PRIVATE_TITLE = "PRIVATE_LIVE_TITLE"
 PRIVATE_BODY = "PRIVATE_LIVE_BODY"
+NOTITLE_BODY = "NOTITLE_LIVE_BODY"
+LIVE_PATH_SECRET = "LIVE_PATH_SECRET"
+LIVE_QUERY_SECRET = "LIVE_QUERY_SECRET"
 
 _PAGES = {
     "/focused": (FOCUSED_TITLE, FOCUSED_BODY),
@@ -48,12 +52,18 @@ _PAGES = {
     "/revoked": (REVOKED_TITLE, REVOKED_BODY),
     "/unapproved": (UNAPPROVED_TITLE, UNAPPROVED_BODY),
     "/private": (PRIVATE_TITLE, PRIVATE_BODY),
+    f"/{LIVE_PATH_SECRET}": ("", NOTITLE_BODY),
 }
 
 
 def _html(title: str, body: str) -> str:
+    title_tag = f"<title>{title}</title>" if title else ""
+    return _document(title_tag, body)
+
+
+def _document(title_tag: str, body: str) -> str:
     return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>{title}</title>
+<html><head><meta charset="utf-8">{title_tag}
 <script>
 window.__contentReads = 0;
 window.__cookieReads = 0;
@@ -317,6 +327,60 @@ def test_live_chrome_incognito_window_keeps_no_page_identity(
     assert PRIVATE_TITLE not in stored
     assert PRIVATE_BODY not in stored
     assert "/private" not in stored
+
+
+def test_live_chrome_untitled_page_does_not_keep_the_address(
+    chrome: _Chrome, pages: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level("DEBUG")
+    app = Steward(clock=ManualClock(datetime(2026, 3, 1, tzinfo=timezone.utc)), data_dir=tmp_path / "pc")
+    app.approve_site("127.0.0.1")
+    app.start_observation()
+    target_url = f"{pages}/{LIVE_PATH_SECRET}?token={LIVE_QUERY_SECRET}#LIVE_FRAG_SECRET"
+    with CdpBrowser(chrome.debugger_url) as browser:
+        opened = _open_page(browser, target_url, new_window=True)
+        browser.call("Target.activateTarget", {"targetId": opened})
+        _wait_until(
+            lambda: browser.evaluate(browser.attach(opened), "document.body && document.body.innerText")
+            == NOTITLE_BODY,
+            "untitled page did not load",
+        )
+    extractor = ChromeCdpExtractor(chrome.debugger_url)
+    found = None
+
+    def captured() -> bool:
+        nonlocal found
+        observation = extractor.capture()
+        if (
+            observation.focused
+            and len(observation.pages) == 1
+            and observation.pages[0].title == ""
+            and observation.pages[0].body is not None
+            and NOTITLE_BODY in observation.pages[0].body
+        ):
+            found = observation
+            return True
+        return False
+
+    _wait_until(captured, "untitled focused page was not captured")
+    assert found is not None
+    observation = found
+    assert LIVE_PATH_SECRET not in observation.pages[0].title
+    assert LIVE_QUERY_SECRET not in observation.pages[0].title
+    app.observe(observation)
+    record = app.activity_records()[0]
+    assert record["domain"] == "127.0.0.1"
+    assert record["title"] is None
+    assert NOTITLE_BODY in (app.read_body(str(record["id"])).text or "")
+    backup = tmp_path / "backup.zip"
+    app.write_default_backup(backup)
+    with zipfile.ZipFile(backup) as archive:
+        backup_text = archive.read("activity-export.json").decode()
+    stored = _stored_text(app.data_dir)
+    for blob in (stored, json.dumps(app.export_records()), json.dumps(app.phone_sync_payload()), backup_text, caplog.text):
+        assert LIVE_PATH_SECRET not in blob
+        assert LIVE_QUERY_SECRET not in blob
+        assert "LIVE_FRAG_SECRET" not in blob
 
 
 def _open_page(

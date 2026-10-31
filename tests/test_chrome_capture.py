@@ -625,6 +625,128 @@ def test_page_text_cannot_authorize_commands_or_become_a_user_statement(
     assert app.read_body(record["id"]).text == instruction
 
 
+def test_address_shaped_title_is_not_retained(app: Steward, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("DEBUG")
+    app.start_observation()
+    chrome_title = f"example.com:8443/{PATH_SECRET}?token={URL_SECRET}#{FRAG_SECRET}"
+    observe(app, pages=(page(url=SECRET_URL, title=chrome_title, body=BODY),))
+    observe(
+        app,
+        pages=(page(page_id="blank-title", url="https://example.com/blank", title="   ", body=OTHER_BODY),),
+    )
+
+    titles = [record["title"] for record in app.activity_records()]
+    assert titles == [None, None]
+    stored = raw_tree(app.data_dir)
+    exported = json.dumps(app.export_records())
+    synced = json.dumps(app.phone_sync_payload())
+    for blob in (stored, exported, synced, caplog.text):
+        assert PATH_SECRET not in blob
+        assert URL_SECRET not in blob
+        assert FRAG_SECRET not in blob
+        assert USER_SECRET not in blob
+        assert "8443" not in blob
+
+
+def test_title_change_does_not_refresh_the_body(app: Steward, clock: ManualClock) -> None:
+    app.approve_site("example.com")
+    app.start_observation()
+    observe(app, pages=(page(url="https://example.com/inbox", title="Inbox", body=BODY),))
+    captured_at = app.activity_records()[0]["captured_at"]
+    clock.advance(days=6)
+    observe(
+        app,
+        pages=(
+            page(
+                url=f"https://example.com/inbox#{FRAG_SECRET}",
+                title="Inbox (2)",
+                body=NEW_BODY,
+            ),
+        ),
+    )
+
+    records = app.activity_records()
+    assert len(records) == 1
+    assert records[0]["title"] == "Inbox (2)"
+    assert records[0]["captured_at"] == captured_at
+    assert records[0]["duration_seconds"] == 6 * 24 * 60 * 60
+    assert app.read_body(str(records[0]["id"])).text == BODY
+    stored = raw_tree(app.data_dir)
+    assert NEW_BODY not in stored
+    assert FRAG_SECRET not in stored
+
+
+def test_expired_page_can_be_captured_again(app: Steward, clock: ManualClock) -> None:
+    app.approve_site("example.com")
+    app.start_observation()
+    observe(app, pages=(page(body=BODY),))
+    first_id = str(app.activity_records()[0]["id"])
+    clock.advance(days=7)
+    observe(app, pages=(page(body=NEW_BODY),))
+
+    records = app.activity_records()
+    assert [record["page_content"] for record in records] == ["expired", "available"]
+    assert app.read_body(first_id).text is None
+    assert app.read_body(str(records[1]["id"])).text == NEW_BODY
+    clock.advance(days=7, seconds=-1)
+    assert app.read_body(str(records[1]["id"])).status == "available"
+    assert app.read_body(first_id).status == "expired"
+
+
+def test_unicode_and_punycode_names_approve_the_same_site(app: Steward) -> None:
+    app.approve_site("münchen.de")
+    assert app.approved_sites() == ("münchen.de",)
+    app.start_observation()
+    observe(
+        app,
+        pages=(
+            page(
+                url="http://xn--mnchen-3ya.de/pfad",
+                title="Stadt",
+                body=BODY,
+            ),
+        ),
+    )
+
+    record = app.activity_records()[0]
+    assert record["domain"] == "münchen.de"
+    assert record["page_content"] == "available"
+    assert app.read_body(str(record["id"])).text == BODY
+
+
+def test_approval_rejects_non_http_and_ambiguous_userinfo(app: Steward) -> None:
+    with pytest.raises(ValueError) as exc:
+        app.approve_site("javascript:alert(1)")
+    assert "alert" not in str(exc.value)
+    with pytest.raises(ValueError):
+        app.approve_site("data:text/html,hi")
+    with pytest.raises(ValueError):
+        app.approve_site(f"trusted.example@{USER_SECRET}.example")
+    assert app.approved_sites() == ()
+    assert USER_SECRET not in raw_tree(app.data_dir)
+    app.approve_site(f"https://user:{USER_SECRET}@example.com/{PATH_SECRET}")
+    assert app.approved_sites() == ("example.com",)
+    assert USER_SECRET not in raw_tree(app.data_dir)
+    assert PATH_SECRET not in raw_tree(app.data_dir)
+
+
+def test_capture_files_are_private_to_the_user(app: Steward) -> None:
+    app.approve_site("example.com")
+    app.start_observation()
+    observe(app)
+    app.export_records()
+    assert app.data_dir.stat().st_mode & 0o777 == 0o700
+    saw_file = False
+    for path in app.data_dir.rglob("*"):
+        mode = path.stat().st_mode & 0o777
+        if path.is_dir():
+            assert mode == 0o700
+        elif path.is_file():
+            saw_file = True
+            assert mode == 0o600
+    assert saw_file
+
+
 def test_untracked_body_copies_are_removed_on_open(app: Steward, clock: ManualClock) -> None:
     app.approve_site("example.com")
     app.start_observation()
